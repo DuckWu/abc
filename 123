@@ -1,25 +1,35 @@
-1. JSON File Naming Convention Change
-Category	Description
-Previous File Naming	bsc_brcc_php_interactive_cp_letter_print_MMDDCCYYHHMMSSsss_001.<env>.json
-Updated File Naming	bsc_<tbd>_php_interactive_cp_letter_print_MMDDCCYYHHMMSSsss_001.<env>.json
-Change Summary	The hardcoded vendor designation (brcc) in the filename is replaced with a dynamic vendor value.
-Routing Impact	No routing changes are required. Logstash continues to ingest JSON files without modification.
-Vendor Identification	Vendor name will be extracted from the filename using Logstash processing (e.g., grok pattern match).
-2. Dashboard Requirements
-New Dashboards
-Requirement	Description
-Dashboard Creation	Dashboards will be created as described in the attached documentation once data is available.
-Content Guidelines	Must follow rules around section ordering, product-type fields, and event capture formatting.
-Cleanup Tasks	Remove placeholder text: "New Dashboard Development Requirements".
-Existing Dashboards (Kibana)
-Dashboard Area	Change Summary
-Broadridge Field Update	The existing "Broadridge" field in dashboards will be renamed to "Broadridge Mailed".
-Addition of New Vendor Field	A new field <Vendor Name> Mailed will be added to support counts per new vendor.
-Vendor Dashboards	Update filters and aggregations to incorporate the new vendor field.
-Cleanup Tasks	Remove placeholder text: "Existing Dashboard Changes".
-3. Acceptance Criteria
-Criteria	Expected Outcome
-Vendor has created compliant #3 JSON	JSON files follow the new naming convention and field structure.
-JSON files are successfully ingested by Logstash	Vendor name is extracted correctly from filename during ingestion.
-Metadata fields appear correctly in dashboards	"Broadridge Mailed" and <Vendor Name> Mailed data is captured and visualized appropriately.
-Routing remains unchanged	No disruption or modification required in routing or Logstash ingestion pipelines.
+h1. Centralized Print JSON and Dashboard Enhancements – Elastic Implementation Summary
+
+h2. 1. JSON File Naming Convention Change
+
+|| Category || Description ||
+| Previous File Naming | bsc_brcc_php_interactive_cp_letter_print_MMDDCCYYHHMMSSsss_001.<env>.json |
+| Updated File Naming | bsc_<tbd>_php_interactive_cp_letter_print_MMDDCCYYHHMMSSsss_001.<env>.json |
+| Change Summary | The hardcoded vendor designation (brcc) in the filename is replaced with a dynamic vendor value. |
+| Routing Impact | No routing changes are required. Logstash continues to ingest JSON files without modification. |
+| Vendor Identification | Vendor name will be extracted from the filename using Logstash processing (e.g., grok pattern match). |
+
+h2. 2. Dashboard Requirements
+
+h3. New Dashboards
+
+|| Requirement || Description ||
+| Dashboard Creation | Dashboards will be created as described in the attached documentation once data is available. |
+| Content Guidelines | Must follow rules around section ordering, product-type fields, and event capture formatting. |
+| Cleanup Tasks | Remove placeholder text: "New Dashboard Development Requirements". |
+
+h3. Existing Dashboards (Kibana)
+
+|| Dashboard Area || Change Summary ||
+| Broadridge Field Update | The existing "Broadridge" field in dashboards will be renamed to "Broadridge Mailed". |
+| Addition of New Vendor Field | A new field "<Vendor Name> Mailed" will be added to support counts per new vendor. |
+| Vendor Dashboards | Update filters and aggregations to incorporate the new vendor field. |
+| Cleanup Tasks | Remove placeholder text: "Existing Dashboard Changes". |
+
+h2. 3. Acceptance Criteria
+
+|| Criteria || Expected Outcome ||
+| Vendor has created compliant #3 JSON | JSON files follow the new naming convention and field structure. |
+| JSON files are successfully ingested by Logstash | Vendor name is extracted correctly from filename during ingestion. |
+| Metadata fields appear correctly in dashboards | "Broadridge Mailed" and "<Vendor Name> Mailed" data is captured and visualized appropriately. |
+| Routing remains unchanged | No disruption or modification required in routing or Logstash ingestion pipelines. |
