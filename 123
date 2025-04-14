@@ -1,35 +1,23 @@
-h1. Centralized Print JSON and Dashboard Enhancements – Elastic Implementation Summary
+After team discussion and evaluation of routing options for handling JSON files from multiple vendors, we have aligned on:
 
-h2. 1. JSON File Naming Convention Change
+Option 2: Create a New Folder for incoming files from new vendors (e.g., SmartComm).
 
-|| Category || Description ||
-| Previous File Naming | bsc_brcc_php_interactive_cp_letter_print_MMDDCCYYHHMMSSsss_001.<env>.json |
-| Updated File Naming | bsc_<tbd>_php_interactive_cp_letter_print_MMDDCCYYHHMMSSsss_001.<env>.json |
-| Change Summary | The hardcoded vendor designation (brcc) in the filename is replaced with a dynamic vendor value. |
-| Routing Impact | No routing changes are required. Logstash continues to ingest JSON files without modification. |
-| Vendor Identification | Vendor name will be extracted from the filename using Logstash processing (e.g., grok pattern match). |
+Rationale:
 
-h2. 2. Dashboard Requirements
+Minimizes risk to existing Broadridge pipeline
 
-h3. New Dashboards
+Allows isolated testing and controlled rollout for new vendors
 
-|| Requirement || Description ||
-| Dashboard Creation | Dashboards will be created as described in the attached documentation once data is available. |
-| Content Guidelines | Must follow rules around section ordering, product-type fields, and event capture formatting. |
-| Cleanup Tasks | Remove placeholder text: "New Dashboard Development Requirements". |
+Provides long-term flexibility as vendor-specific requirements evolve
 
-h3. Existing Dashboards (Kibana)
+Next Steps:
 
-|| Dashboard Area || Change Summary ||
-| Broadridge Field Update | The existing "Broadridge" field in dashboards will be renamed to "Broadridge Mailed". |
-| Addition of New Vendor Field | A new field "<Vendor Name> Mailed" will be added to support counts per new vendor. |
-| Vendor Dashboards | Update filters and aggregations to incorporate the new vendor field. |
-| Cleanup Tasks | Remove placeholder text: "Existing Dashboard Changes". |
+Sterling to configure new inbound and Logstash input folders
 
-h2. 3. Acceptance Criteria
+Logstash team to add support for new folder in pipeline
 
-|| Criteria || Expected Outcome ||
-| Vendor has created compliant #3 JSON | JSON files follow the new naming convention and field structure. |
-| JSON files are successfully ingested by Logstash | Vendor name is extracted correctly from filename during ingestion. |
-| Metadata fields appear correctly in dashboards | "Broadridge Mailed" and "<Vendor Name> Mailed" data is captured and visualized appropriately. |
-| Routing remains unchanged | No disruption or modification required in routing or Logstash ingestion pipelines. |
+Kibana team to update dashboards to include new vendor field
+
+End-to-end testing before production rollout
+
+This decision ensures safe onboarding of additional vendors while maintaining the integrity of current processes.
