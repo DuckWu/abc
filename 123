@@ -1,23 +1,411 @@
-After team discussion and evaluation of routing options for handling JSON files from multiple vendors, we have aligned on:
+#
+# Comms Transform Enablement - Data ingestion from ods
+#
+# cte5-digitaldocs.erb
+# V1.0
 
-Option 2: Create a New Folder for incoming files from new vendors (e.g., SmartComm).
+input
+{
+	# Need to log statement here to show that output has been executed.
 
-Rationale:
 
-Minimizes risk to existing Broadridge pipeline
+	# testing
+	file
+	{
+		id => "main_input_file"
+		path => "${LS_XML_PATH:/data/logstash/esingest/metadata/digitaldocs/letters/ods}/*.json"
+		start_position => "beginning"
+		sincedb_path => "${LS_DATA_LOG_PATH:/data/logstash/data}/cte5_input_sincedb.log"
+		exclude => "*.gz"
+		type => "plain"
+		mode => "read"
 
-Allows isolated testing and controlled rollout for new vendors
+		#json files will be processed and their respective path logged in processedFile.log and eventually be deleted
+		file_completed_action => "log_and_delete"
 
-Provides long-term flexibility as vendor-specific requirements evolve
+		#The rotation of the below file will be processed by procFileRotate.sh after it reaches the threshold of 1024MB
+		file_completed_log_path => "${LS_DATA_LOG_PATH:/data/logstash/data}/cte5_input_processedFile.log"
 
-Next Steps:
+		# This is causing older files (even if re-touched with new stamp) to be ignored.
+		#ignore_older => 172800
 
-Sterling to configure new inbound and Logstash input folders
+		#discover_interval => 1
 
-Logstash team to add support for new folder in pipeline
+		#New Files will be checked after every 30 minutes
+		#stat_interval => "30 min"
+	}
+}
 
-Kibana team to update dashboards to include new vendor field
+filter
+{
+    # strips off leading/trailing whitespace
+	mutate {
+		id => "strip_message"
+		strip => ["message"]
+	}
+	mutate{
+		gsub =>["message", "\r\n", "\n"]
+	}
+	if "totalCount" in [message] and [message] =~ /\[$/ {
+		ruby {
+			id => "log_totalCount_by_ruby"
+			code => '
+				msg = event.get("message")
+				match = msg.match(/.*totalCount[^0-9]+(\d+)/).captures
+				if(match)
+					# CTE ingest from ods document count[473] time[2019-10-23 13:03:41 UTC] in file[/data/logstash/esingest/metadata/xxx/infa/*.json]
+					logger.info("CTE ingest from ods document count[" + match[0].to_s + "] time[" + Time.now.utc.to_s + "] in file[" + event.get("path") + "]")
+				end
+			'
+		}
 
-End-to-end testing before production rollout
+		# If totalCount appear somewhere else that record can be dropped. Can we add some checking to make sure it is only the totalCount row we meant to drop?
+		drop { id => "drop_totalCount_event" }
+	}
 
-This decision ensures safe onboarding of additional vendors while maintaining the integrity of current processes.
+	# Drop last row with closing array loop
+	if [message] == ']}' or [message] == '' {
+			drop { id => "drop_]}" }
+	}
+
+	# strips off trailing comma
+	mutate {
+		id => "remove_last_comma"
+		gsub => ["message",",$",""]
+	}
+
+	# Converts into a json object
+	json {
+		id => "convert_message_to_json"
+		source => "message"
+	}
+
+	# creating index pattern
+	ruby
+	{
+		id => "main_ruby_ext_script"
+		path => "${LS_SCRIPT_PATH:/data/logstash/scripts/ruby}/index-create.rb"
+		script_params =>
+		{
+			"indexNamePrefix" => "digitaldocs-cte"
+			"nasPdfBasePath" => "${nasPdfBasePath:/nfs/data/documents/odsltrs}"
+			"nasReportType" => "${reportType:daily}"
+			"useTimestampField" => "true"
+			"timestampFieldName" => "documentReportDate"
+			"generateDocBasePathFromDocPath" => "true"
+			"docPathFieldName" => "documentPath"
+		}
+	}
+
+	if ![@metadata][indexName]
+	{
+		# invalid index name when file path has wrong timestamp format
+		# error is raised in index-create.rb already
+		drop { id => "drop_event_due_to_invalid_indexname" }
+	}
+
+	mutate {
+	  # documentId can not be null or empty, strip it here for easy comparison later on
+		id => "strip_documentId"
+		strip => ["documentId"]
+	}
+
+	# Call this for every single event to get more accurate creation time
+	ruby
+	{
+		id => "main_ruby_logger"
+		code => '
+		  event.set("[@metadata][updateDate]", Time.now.utc)
+			documentId = event.get("documentId")
+			if documentId.nil? or documentId == ""
+			  logger.error("documentId is missing or empty in file[" + event.get("path") + "]")
+			end
+			'
+	}
+
+	if (( [documentId] and [documentId] != "" ) )
+	{
+		mutate
+		{
+			id => "main_modify_fields"
+			add_field =>
+			{
+				"lastUpdate2Date" => "%{[@metadata][updateDate]}"
+				"[metadata][path2]" => "%{path}"
+			}
+		}
+
+		if ([@metadata][useDocBasePathOnly])
+		{
+			mutate {
+				id => "main_modify_use_base_documentPath_only"
+				replace => {
+					"documentPath" => "%{[@metadata][docBasePath]}"
+				}
+			}
+		}
+		else
+		{
+			mutate {
+				id => "main_modify_valid_documentPath"
+				replace => {
+					"documentPath" => "%{[@metadata][docBasePath]}/%{documentPath}"
+				}
+			}
+		}
+	}
+	else
+	{
+		# drop this event because it does not have documentId
+		drop{
+			id => "drop_event_due_to_invalid_documentId"
+		}
+	}
+
+	if ([metadata]) {
+		if[metadata][batchSentToUSPS] {
+			mutate {
+				lowercase => ["[metadata][batchSentToUSPS]"]
+			}
+		}
+		ruby {
+			id => "check_brcc_composed"
+			code => '
+				path2 = event.get("path")
+				if path2.include? "bsc_sc_accrual_ntc_daily_dmhc_letter_" or path2.include? "bsc_sc_accrual_ntc_monthly_dmhc_letter_" or path2.include? "bsc_sc_accrual_ntc_daily_doi_letter_" or path2.include? "bsc_sc_accrual_ntc_monthly_doi_letter_"
+					event.set("isBRCCComposed", true)
+				end
+			'
+		}
+	}
+
+	mutate {
+		id => "remove_unused_fields"
+		remove_field => ["message", "tags", "@version", "@timestamp", "path", "host", "type", "appliancePrintInfo"]
+	}
+
+}
+
+output
+{
+    # Need to log statement here to show that output has been executed.
+
+    #for debugging purpose
+    #stdout {    codec => json_lines    }
+
+    elasticsearch
+    {
+        id => "main_es"
+        # Uncomment out this block for dev testing..
+        #hosts => [ "localhost:9200" ]
+
+        # Comment out this block for dev testing...
+        hosts => ["https://es1-edocsmd-dev01:9200"]
+				user => svc_es_logstsh_npe
+        password => "${svc_es_logstsh_npe_password}"
+        ssl => true
+        cacert => "/opt/logstash/logstash/config/certs/ca.crt"
+				index => "%{[@metadata][indexName]}"
+				document_id => "%{documentId}"
+
+				# find and add new nodes to Logstash list of host
+				sniffing => true
+
+				action => update
+
+				#Document will either be updated or inserted but not duplicated
+				doc_as_upsert => true
+    }
+}
+
+
+
+
+#
+# Comms Transform Enablement - Data ingestion from Broadridge
+#
+# cte3-digitaldocs.erb
+# V1.0
+
+input
+{
+	# Need to log statement here to show that output has been executed.
+
+
+	# testing
+	file
+	{
+		id => "main_input_file"
+		path => "${LS_XML_PATH:/data/logstash/esingest/metadata/digitaldocs/letters/broadridge}/*.json"
+		start_position => "beginning"
+		sincedb_path => "${LS_DATA_LOG_PATH:/data/logstash/data}/cte3_input_sincedb.log"
+		exclude => "*.gz"
+		type => "plain"
+		mode => "read"
+
+		#json files will be processed and their respective path logged in processedFile.log and eventually be deleted
+		file_completed_action => "log_and_delete"
+
+		#The rotation of the below file will be processed by procFileRotate.sh after it reaches the threshold of 1024MB
+		file_completed_log_path => "${LS_DATA_LOG_PATH:/data/logstash/data}/cte3_input_processedFile.log"
+
+		# This is causing older files (even if re-touched with new stamp) to be ignored.
+		#ignore_older => 172800
+
+		#discover_interval => 1
+
+		#New Files will be checked after every 30 minutes
+		#stat_interval => "30 min"
+	}
+}
+
+filter
+{
+   # strips off leading/trailing whitespace
+	mutate {
+		id => "strip_message"
+		strip => ["message"]
+	}
+
+	if "totalCount" in [message] and [message] =~ /\[$/ {
+		ruby {
+			id => "log_totalCount_by_ruby"
+			code => '
+				msg = event.get("message")
+				match = msg.match(/.*totalCount[^0-9]+(\d+)/).captures
+				if(match)
+					# CTE ingest from broadridge document count[473] time[2019-10-23 13:03:41 UTC] in file[/data/logstash/esingest/metadata/xxx/infa/*.json]
+					logger.info("CTE ingest from broadridge document count[" + match[0].to_s + "] time[" + Time.now.utc.to_s + "] in file[" + event.get("path") + "]")
+				end
+			'
+		}
+
+		# If totalCount appear somewhere else that record can be dropped. Can we add some checking to make sure it is only the totalCount row we meant to drop?
+		drop { id => "drop_totalCount_event" }
+	}
+
+	# Drop last row with closing array loop
+	if [message] == ']}' or [message] == '' {
+			drop { id => "drop_]}" }
+	}
+
+	# strips off trailing comma
+	mutate {
+		id => "remove_last_comma"
+		gsub => ["message",",$",""]
+	}
+
+	# Converts into a json object
+	json {
+		id => "convert_message_to_json"
+		source => "message"
+	}
+
+	# creating index pattern
+	ruby
+	{
+		id => "main_ruby_ext_script"
+		path => "${LS_SCRIPT_PATH:/data/logstash/scripts/ruby}/index-create.rb"
+		script_params =>
+		{
+			"indexNamePrefix" => "digitaldocs-cte"
+			"nasPdfBasePath" => "${nasPdfBasePath:/data/documents/portal_member_bills}"
+			"nasReportType" => "${reportType:daily}"
+			"useTimestampField" => "true"
+			"timestampFieldName" => "documentReportDate"
+		}
+	}
+
+	if ![@metadata][indexName]
+	{
+		# invalid index name when file path has wrong timestamp format
+		# error is raised in index-create.rb already
+		drop { id => "drop_event_due_to_invalid_indexname" }
+	}
+
+	mutate {
+		# documentId can not be null or empty, strip it here for easy comparison later on
+		id => "strip_documentId"
+		strip => ["documentId"]
+	}
+
+	# Call this for every single event to get more accurate creation time
+	ruby
+	{
+		id => "main_ruby_logger"
+		code => '
+			event.set("[@metadata][updateDate]", Time.now.utc)
+			documentId = event.get("documentId")
+			if documentId.nil? or documentId == ""
+			  logger.error("documentId is missing or empty in file[" + event.get("path") + "]")
+			end
+			'
+	}
+
+	if ([documentId] and [documentId] != "")
+	{
+		mutate
+		{
+			id => "main_modify_fields"
+			add_field =>
+			{
+				"lastUpdate3Date" => "%{[@metadata][updateDate]}"
+				"[metadata][path3]" => "%{path}"
+			}
+		}
+	}
+	else
+	{
+		# drop this event because it does not have documentId
+		drop{
+			id => "drop_event_due_to_invalid_documentId"
+		}
+	}
+
+	mutate {
+		id => "remove_unused_fields"
+		remove_field => ["message", "tags", "@version", "@timestamp", "path", "host", "type", "appliancePrintInfo"]
+	}
+
+	if [documentPath] {
+		mutate {
+			id => "remove_documentPath_to_protect_override"
+			remove_field => ["documentPath"]
+		}
+	}
+
+}
+
+output
+{
+    # Need to log statement here to show that output has been executed.
+
+    #for debugging purpose
+    #stdout {    codec => json_lines    }
+
+    elasticsearch
+    {
+        id => "main_es"
+        # Uncomment out this block for dev testing..
+        #hosts => [ "localhost:9200" ]
+
+        # Comment out this block for dev testing...
+        hosts => ["https://es1-edocsmd-dev01:9200"]
+        user => svc_es_logstsh_npe
+        password => "${svc_es_logstsh_npe_password}"
+
+        ssl => true
+        cacert => "/opt/logstash/logstash/config/certs/ca.crt"
+				index => "%{[@metadata][indexName]}"
+				document_id => "%{documentId}"
+
+				# find and add new nodes to Logstash list of host
+				sniffing => true
+
+				action => update
+
+				#Document will either be updated or inserted but not duplicated
+				doc_as_upsert => true
+
+    }
+}
