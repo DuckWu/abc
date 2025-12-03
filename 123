@@ -1,191 +1,80 @@
-#!/usr/bin/env python3
-"""
-Clean up old Elasticsearch indices for a single alias in Elastic Cloud.
-
-Assumptions:
-- Index name format: <alias_name>_<date_number>
-  e.g. logsapp_20250611, orders_20250101
-- You pass a single alias name (e.g. "orders").
-- For that alias:
-    - Keep the index currently assigned to that alias
-      (prefer is_write_index=true if set).
-    - Also keep the latest index by date_number.
-    - Delete all other indices with that alias pattern.
-
-Safety:
-- DRY_RUN = True by default: prints what it would delete without deleting.
-"""
 
 import sys
 import re
 from elasticsearch import Elasticsearch
 
-# ------------- CONFIG -------------
-CLOUD_ID = "your-cloud-id-here"  # e.g. "cluster-name:base64stuff"
-API_KEY = "your-api-key-here"    # or use username/password below instead
-
-USE_API_KEY = True  # set False if you want to use basic auth
-
+CLOUD_ID = ""
+API_KEY = ""
+HOSTS = ["http://localhost:9200"]
+USE_CLOUD = False
+USE_API_KEY = True
 USERNAME = "elastic"
-PASSWORD = "your-password-here"
-
-# Safety: start in dry-run mode
+PASSWORD = ""
 DRY_RUN = True
 
-# How to detect the date part: last underscore + digits
-DATE_SUFFIX_REGEX = re.compile(r"^(?P<prefix>.+)_(?P<date>\d+)$")
-# ----------------------------------
-
+REGEX = re.compile(r"^(?P<prefix>.+)_(?P<date>\d{8})_(?P<serial>\d+)$")
 
 def make_client():
-    if USE_API_KEY:
-        es = Elasticsearch(
-            cloud_id=CLOUD_ID,
-            api_key=API_KEY,
-            request_timeout=60,
-        )
+    if USE_CLOUD:
+        if USE_API_KEY:
+            return Elasticsearch(cloud_id=CLOUD_ID, api_key=API_KEY, request_timeout=60)
+        return Elasticsearch(cloud_id=CLOUD_ID, basic_auth=(USERNAME, PASSWORD), request_timeout=60)
     else:
-        es = Elasticsearch(
-            cloud_id=CLOUD_ID,
-            basic_auth=(USERNAME, PASSWORD),
-            request_timeout=60,
-        )
-    return es
+        if USERNAME:
+            return Elasticsearch(hosts=HOSTS, basic_auth=(USERNAME, PASSWORD), request_timeout=60)
+        return Elasticsearch(hosts=HOSTS, request_timeout=60)
 
-
-def split_alias_and_date(index_name: str):
-    """
-    Parse index_name into (alias_name, date_int).
-
-    Expected pattern: <alias_name>_<number>
-    Returns (alias_name, date_int) or (None, None) if no match.
-    """
-    m = DATE_SUFFIX_REGEX.match(index_name)
+def parse_index(name):
+    m = REGEX.match(name)
     if not m:
-        return None, None
-    prefix = m.group("prefix")
-    date_str = m.group("date")
-    try:
-        date_int = int(date_str)
-    except ValueError:
-        return None, None
-    return prefix, date_int
+        return None, None, None
+    return m.group("prefix"), int(m.group("date")), int(m.group("serial"))
 
-
-def cleanup_alias(es: Elasticsearch, alias_name: str):
-    """
-    Clean up indices for a single alias.
-    Keeps:
-      - index currently pointed by the alias (preferring is_write_index)
-      - latest index by date suffix
-    Deletes:
-      - all other indices matching alias_name_*
-    """
-    pattern = f"{alias_name}_*"
-
-    print(f"Fetching aliases for indices matching pattern: {pattern}")
-    try:
-        # Returns:
-        # {
-        #   "index_name": {
-        #       "aliases": {
-        #           "alias_name": {...}
-        #       }
-        #   },
-        #   ...
-        # }
-        indices_aliases = es.indices.get_alias(
-            index=pattern,
-            name=alias_name,          # only this alias
-            ignore_unavailable=True,
-        )
-    except Exception as e:
-        print(f"Error calling get_alias: {e}")
-        return
-
-    if not indices_aliases:
-        print(f"No indices found for alias '{alias_name}' with pattern '{pattern}'")
-        return
-
-    index_with_dates = []  # list of (index_name, date_int)
-    current_index = None   # index that alias currently points to (pref is_write_index)
-
+def cleanup_alias(es, alias):
+    indices_aliases = es.indices.get_alias(index=f"{alias}_*", name=alias, ignore_unavailable=True)
+    index_info = []
+    current = None
     for index_name, data in indices_aliases.items():
-        # parse index_name as <alias>_<date>
-        prefix, date_int = split_alias_and_date(index_name)
-        if prefix is None or prefix != alias_name:
-            # Skip any weird ones that don't match alias_name_date format
+        prefix, date_int, serial_int = parse_index(index_name)
+        if prefix != alias:
             continue
-
-        index_with_dates.append((index_name, date_int))
-
-        aliases_for_index = data.get("aliases", {}) or {}
-        alias_info = aliases_for_index.get(alias_name, {})
-
-        # Prefer is_write_index = true as current index
-        if alias_info.get("is_write_index"):
-            current_index = index_name
-
-    if not index_with_dates:
-        print(f"No indices in '{pattern}' matched the <alias>_<date> pattern for alias '{alias_name}'.")
+        index_info.append((index_name, date_int, serial_int))
+        info = data.get("aliases", {}).get(alias, {})
+        if info.get("is_write_index"):
+            current = index_name
+    if not index_info:
+        print(f"no indices found for alias {alias}")
         return
-
-    # Sort by date suffix
-    index_with_dates_sorted = sorted(index_with_dates, key=lambda x: x[1])
-    all_indices = [name for name, _ in index_with_dates_sorted]
-
-    # Determine current_index if not set via is_write_index
-    if current_index is None:
-        # If no explicit write index, treat latest as current
-        current_index = index_with_dates_sorted[-1][0]
-
-    # Latest index by date
-    latest_index = index_with_dates_sorted[-1][0]
-
-    # Indices to keep: current index + latest index (may be the same)
-    keep_set = {current_index, latest_index}
-    delete_candidates = [idx for idx in all_indices if idx not in keep_set]
-
-    print(f"\nAlias: {alias_name}")
-    print(f"  All indices: {all_indices}")
-    print(f"  Current index (alias target): {current_index}")
-    print(f"  Latest index by date:        {latest_index}")
-    print(f"  Will keep: {sorted(keep_set)}")
-
-    if not delete_candidates:
-        print("  Nothing to delete for this alias.")
-        return
-
-    print(f"  Candidates to DELETE: {delete_candidates}")
-
-    # Execute deletions or dry-run
+    index_info_sorted = sorted(index_info, key=lambda x: (x[1], x[2]))
+    all_indices = [i[0] for i in index_info_sorted]
+    latest = index_info_sorted[-1][0]
+    if current is None:
+        current = latest
+    keep = {current, latest}
+    delete = [i for i in all_indices if i not in keep]
+    print("alias:", alias)
+    print("all:", all_indices)
+    print("current:", current)
+    print("latest:", latest)
+    print("keep:", sorted(keep))
+    print("delete:", delete)
     if DRY_RUN:
-        print("\nDRY_RUN is enabled. No indices were actually deleted.")
+        print("DRY_RUN enabled, nothing deleted")
         return
-
-    print("\nDeleting indices...")
-    for idx in delete_candidates:
-        try:
-            es.indices.delete(index=idx)
-            print(f"Deleted index: {idx}")
-        except Exception as e:
-            print(f"Failed to delete {idx}: {e}")
-
+    for idx in delete:
+        es.indices.delete(index=idx)
+        print("deleted:", idx)
 
 def main():
-    # Get alias name from CLI arg or prompt
     if len(sys.argv) > 1:
-        alias_name = sys.argv[1]
+        alias = sys.argv[1]
     else:
-        alias_name = input("Enter alias name to clean (e.g. orders): ").strip()
-
-    if not alias_name:
-        print("Alias name is required.")
-        sys.exit(1)
-
+        alias = input("alias: ").strip()
+    if not alias:
+        print("alias required")
+        return
     es = make_client()
-    cleanup_alias(es, alias_name)
-
+    cleanup_alias(es, alias)
 
 if __name__ == "__main__":
     main()
