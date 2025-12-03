@@ -1,202 +1,191 @@
-###############################################################
-#  digitaldocs‑cte.conf
-#  Handles “print” and non‑print JSON files in one pipeline
-###############################################################
+#!/usr/bin/env python3
+"""
+Clean up old Elasticsearch indices for a single alias in Elastic Cloud.
 
-############################
-#  INPUT (unchanged)
-############################
-input {
-  file {
-    id                     => "main_input_file"
-    path                   => "${LS_XML_PATH:/data/logstash/esingest/metadata/digitaldocs/letters/ods}/*.json"
-    start_position         => "beginning"
-    sincedb_path           => "${LS_DATA_LOG_PATH:/data/logstash/data}/cte5_input_sincedb.log"
-    type                   => "plain"
-    mode                   => "read"
-    exclude                => "*.gz"
-    file_completed_action  => "log_and_delete"
-    file_completed_log_path=> "${LS_DATA_LOG_PATH:/data/logstash/data}/cte5_input_processedFile.log"
-  }
-}
+Assumptions:
+- Index name format: <alias_name>_<date_number>
+  e.g. logsapp_20250611, orders_20250101
+- You pass a single alias name (e.g. "orders").
+- For that alias:
+    - Keep the index currently assigned to that alias
+      (prefer is_write_index=true if set).
+    - Also keep the latest index by date_number.
+    - Delete all other indices with that alias pattern.
 
-############################
-#  FILTER
-############################
-filter {
+Safety:
+- DRY_RUN = True by default: prints what it would delete without deleting.
+"""
 
-  # 0.  Derive [filename] from [path] for branching
-  ruby {
-    id   => "extract_filename"
-    code => '
-      path = event.get("path")
-      event.set("filename", File.basename(path)) if path
-    '
-  }
+import sys
+import re
+from elasticsearch import Elasticsearch
 
-  # 1.  Logic that ALL files share  ────────────────────────────
-  if "totalCount" in [message] and [message] =~ /\[$/ {
-    ruby {
-      id   => "log_totalCount_by_ruby"
-      code => '
-        msg   = event.get("message")
-        match = msg.match(/.*totalCount[^0-9]+(\d+)/).captures
-        if match
-          logger.info("CTE ingest document count[" +
-                      match[0] + "] time[" + Time.now.utc.to_s +
-                      "] in file[" + event.get("path") + "]")
-        end
-      '
-    }
-    drop { id => "drop_totalCount_event" }
-  }
+# ------------- CONFIG -------------
+CLOUD_ID = "your-cloud-id-here"  # e.g. "cluster-name:base64stuff"
+API_KEY = "your-api-key-here"    # or use username/password below instead
 
-  # 2.  Branch on filename containing "print"  ────────────────
-  if "print" in [filename] {
+USE_API_KEY = True  # set False if you want to use basic auth
 
-    ##########################
-    #  PRINT BRANCH
-    ##########################
-    mutate { id => "add_vendorName_ods" add_field => { "vendorName" => "ods" } }
+USERNAME = "elastic"
+PASSWORD = "your-password-here"
 
-    mutate { strip => ["message"] }
-    if [message] == ']}' or [message] == '' { drop {} }
-    mutate { gsub => ["message", ",$", ""] }
-    json   { source => "message" }
+# Safety: start in dry-run mode
+DRY_RUN = True
 
-    ruby {
-      id   => "index_create_print"
-      path => "${LS_SCRIPT_PATH:/data/logstash/scripts/ruby}/index-create.rb"
-      script_params => {
-        "indexNamePrefix"   => "digitaldocs-cte"
-        "nasPdfBasePath"    => "${nasPdfBasePath:/data/documents/portal_member_bills}"
-        "nasReportType"     => "${reportType:daily}"
-        "useTimestampField" => "true"
-        "timestampFieldName"=> "documentReportDate"
-      }
-    }
+# How to detect the date part: last underscore + digits
+DATE_SUFFIX_REGEX = re.compile(r"^(?P<prefix>.+)_(?P<date>\d+)$")
+# ----------------------------------
 
-    if ![@metadata][indexName] { drop {} }
 
-    mutate { strip => ["documentId"] }
+def make_client():
+    if USE_API_KEY:
+        es = Elasticsearch(
+            cloud_id=CLOUD_ID,
+            api_key=API_KEY,
+            request_timeout=60,
+        )
+    else:
+        es = Elasticsearch(
+            cloud_id=CLOUD_ID,
+            basic_auth=(USERNAME, PASSWORD),
+            request_timeout=60,
+        )
+    return es
 
-    ruby {
-      id => "logger_print"
-      code => '
-        event.set("[@metadata][updateDate]", Time.now.utc)
-        did = event.get("documentId")
-        logger.error("documentId missing in " + event.get("path")) if did.nil? || did.empty?
-      '
-    }
 
-    if ([documentId] and [documentId] != "") {
-      mutate {
-        add_field => { "lastUpdate3Date" => "%{[@metadata][updateDate]}"
-                       "[metadata][path3]" => "%{path}" }
-      }
-    } else {
-      drop {}
-    }
+def split_alias_and_date(index_name: str):
+    """
+    Parse index_name into (alias_name, date_int).
 
-    mutate { remove_field => ["message","tags","@version","@timestamp",
-                              "path","host","type","appliancePrintInfo"] }
+    Expected pattern: <alias_name>_<number>
+    Returns (alias_name, date_int) or (None, None) if no match.
+    """
+    m = DATE_SUFFIX_REGEX.match(index_name)
+    if not m:
+        return None, None
+    prefix = m.group("prefix")
+    date_str = m.group("date")
+    try:
+        date_int = int(date_str)
+    except ValueError:
+        return None, None
+    return prefix, date_int
 
-    if [documentPath] { mutate { remove_field => ["documentPath"] } }
 
-    ##########################
-    #  END PRINT BRANCH
-    ##########################
+def cleanup_alias(es: Elasticsearch, alias_name: str):
+    """
+    Clean up indices for a single alias.
+    Keeps:
+      - index currently pointed by the alias (preferring is_write_index)
+      - latest index by date suffix
+    Deletes:
+      - all other indices matching alias_name_*
+    """
+    pattern = f"{alias_name}_*"
 
-  } else {
+    print(f"Fetching aliases for indices matching pattern: {pattern}")
+    try:
+        # Returns:
+        # {
+        #   "index_name": {
+        #       "aliases": {
+        #           "alias_name": {...}
+        #       }
+        #   },
+        #   ...
+        # }
+        indices_aliases = es.indices.get_alias(
+            index=pattern,
+            name=alias_name,          # only this alias
+            ignore_unavailable=True,
+        )
+    except Exception as e:
+        print(f"Error calling get_alias: {e}")
+        return
 
-    ##########################
-    #  DEFAULT BRANCH
-    ##########################
-    mutate { strip => ["message"] }
-    mutate { gsub  => ["message", "\r\n", "\n"] }
-    if [message] == ']}' or [message] == '' { drop {} }
-    mutate { gsub => ["message", ",$", ""] }
-    json   { source => "message" }
+    if not indices_aliases:
+        print(f"No indices found for alias '{alias_name}' with pattern '{pattern}'")
+        return
 
-    ruby {
-      id   => "index_create_default"
-      path => "${LS_SCRIPT_PATH:/data/logstash/scripts/ruby}/index-create.rb"
-      script_params => {
-        "indexNamePrefix"   => "digitaldocs-cte"
-        "nasPdfBasePath"    => "${nasPdfBasePath:/nfs/data/documents/odsltrs}"
-        "nasReportType"     => "${reportType:daily}"
-        "useTimestampField" => "true"
-        "timestampFieldName"=> "documentReportDate"
-        "generateDocBasePathFromDocPath" => "true"
-        "docPathFieldName"  => "documentPath"
-      }
-    }
+    index_with_dates = []  # list of (index_name, date_int)
+    current_index = None   # index that alias currently points to (pref is_write_index)
 
-    if ![@metadata][indexName] { drop {} }
+    for index_name, data in indices_aliases.items():
+        # parse index_name as <alias>_<date>
+        prefix, date_int = split_alias_and_date(index_name)
+        if prefix is None or prefix != alias_name:
+            # Skip any weird ones that don't match alias_name_date format
+            continue
 
-    mutate { strip => ["documentId"] }
+        index_with_dates.append((index_name, date_int))
 
-    ruby {
-      id => "logger_default"
-      code => '
-        event.set("[@metadata][updateDate]", Time.now.utc)
-        did = event.get("documentId")
-        logger.error("documentId missing in " + event.get("path")) if did.nil? || did.empty?
-      '
-    }
+        aliases_for_index = data.get("aliases", {}) or {}
+        alias_info = aliases_for_index.get(alias_name, {})
 
-    if ([documentId] and [documentId] != "") {
-      mutate {
-        add_field => { "lastUpdate2Date" => "%{[@metadata][updateDate]}"
-                       "[metadata][path2]" => "%{path}" }
-      }
+        # Prefer is_write_index = true as current index
+        if alias_info.get("is_write_index"):
+            current_index = index_name
 
-      if ([@metadata][useDocBasePathOnly]) {
-        mutate { replace => { "documentPath" => "%{[@metadata][docBasePath]}" } }
-      } else {
-        mutate { replace => { "documentPath" => "%{[@metadata][docBasePath]}/%{documentPath}" } }
-      }
-    } else {
-      drop {}
-    }
+    if not index_with_dates:
+        print(f"No indices in '{pattern}' matched the <alias>_<date> pattern for alias '{alias_name}'.")
+        return
 
-    if ([metadata]) {
-      if [metadata][batchSentToUSPS] { mutate { lowercase => ["[metadata][batchSentToUSPS]"] } }
-      ruby {
-        id => "check_brcc_composed"
-        code => '
-          p = event.get("path")
-          if p =~ /bsc_sc_accrual_ntc_(daily|monthly)_(dmhc|doi)_letter_/
-            event.set("isBRCCComposed", true)
-          end
-        '
-      }
-    }
+    # Sort by date suffix
+    index_with_dates_sorted = sorted(index_with_dates, key=lambda x: x[1])
+    all_indices = [name for name, _ in index_with_dates_sorted]
 
-    mutate { remove_field => ["message","tags","@version","@timestamp",
-                              "path","host","type","appliancePrintInfo"] }
+    # Determine current_index if not set via is_write_index
+    if current_index is None:
+        # If no explicit write index, treat latest as current
+        current_index = index_with_dates_sorted[-1][0]
 
-    ##########################
-    #  END DEFAULT BRANCH
-    ##########################
-  }
-}
+    # Latest index by date
+    latest_index = index_with_dates_sorted[-1][0]
 
-############################
-#  OUTPUT (unchanged)
-############################
-output {
-  elasticsearch {
-    id             => "main_es"
-    hosts          => ["https://es1-edocsmd-dev01:9200"]
-    user           => "svc_es_logstsh_npe"
-    password       => "${svc_es_logstsh_npe_password}"
-    ssl            => true
-    cacert         => "/opt/logstash/logstash/config/certs/ca.crt"
-    index          => "%{[@metadata][indexName]}"
-    document_id    => "%{documentId}"
-    sniffing       => true
-    action         => "update"
-    doc_as_upsert  => true
-  }
-}
+    # Indices to keep: current index + latest index (may be the same)
+    keep_set = {current_index, latest_index}
+    delete_candidates = [idx for idx in all_indices if idx not in keep_set]
+
+    print(f"\nAlias: {alias_name}")
+    print(f"  All indices: {all_indices}")
+    print(f"  Current index (alias target): {current_index}")
+    print(f"  Latest index by date:        {latest_index}")
+    print(f"  Will keep: {sorted(keep_set)}")
+
+    if not delete_candidates:
+        print("  Nothing to delete for this alias.")
+        return
+
+    print(f"  Candidates to DELETE: {delete_candidates}")
+
+    # Execute deletions or dry-run
+    if DRY_RUN:
+        print("\nDRY_RUN is enabled. No indices were actually deleted.")
+        return
+
+    print("\nDeleting indices...")
+    for idx in delete_candidates:
+        try:
+            es.indices.delete(index=idx)
+            print(f"Deleted index: {idx}")
+        except Exception as e:
+            print(f"Failed to delete {idx}: {e}")
+
+
+def main():
+    # Get alias name from CLI arg or prompt
+    if len(sys.argv) > 1:
+        alias_name = sys.argv[1]
+    else:
+        alias_name = input("Enter alias name to clean (e.g. orders): ").strip()
+
+    if not alias_name:
+        print("Alias name is required.")
+        sys.exit(1)
+
+    es = make_client()
+    cleanup_alias(es, alias_name)
+
+
+if __name__ == "__main__":
+    main()
